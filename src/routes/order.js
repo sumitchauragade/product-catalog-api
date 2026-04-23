@@ -193,4 +193,90 @@ router.patch('/:id/cancel', async (req, res) => {
   }
 });
 
+// GET — Order status history
+router.get('/:id/status', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT id, status, created_at FROM orders WHERE id = $1',
+      [req.params.id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    const order = result.rows[0];
+    const statuses = ['confirmed', 'processing', 'shipped', 'delivered'];
+    const currentIndex = statuses.indexOf(order.status);
+
+    res.json({
+      order_id: order.id,
+      current_status: order.status,
+      progress: statuses.map((s, i) => ({
+        step: s,
+        completed: i <= currentIndex
+      }))
+    });
+
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PATCH — Update order status
+router.patch('/:id/status', async (req, res) => {
+  const { status } = req.body;
+  const validStatuses = ['confirmed', 'processing', 'shipped', 'delivered', 'cancelled'];
+
+  if (!validStatuses.includes(status)) {
+    return res.status(400).json({
+      error: 'Invalid status',
+      valid_statuses: validStatuses
+    });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    const orderResult = await client.query(
+      'SELECT * FROM orders WHERE id = $1', [req.params.id]
+    );
+
+    if (orderResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    const order = orderResult.rows[0];
+
+    // Restore stock if cancelling a non-cancelled order
+    if (status === 'cancelled' && order.status !== 'cancelled') {
+      await client.query(
+        'UPDATE products SET stock = stock + $1 WHERE id = $2',
+        [order.quantity, order.product_id]
+      );
+    }
+
+    const updated = await client.query(
+      'UPDATE orders SET status = $1 WHERE id = $2 RETURNING *',
+      [status, req.params.id]
+    );
+
+    await client.query('COMMIT');
+
+    res.json({
+      message: `Order status updated to ${status}`,
+      order: updated.rows[0]
+    });
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 module.exports = router;
